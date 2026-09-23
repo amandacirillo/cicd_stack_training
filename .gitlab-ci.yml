@@ -1,0 +1,214 @@
+# ---------------------------------------------------------------------------
+# cicd_stack_training — GitLab CI/CD training pipeline
+#
+# Stages:
+#   1. build   — build Docker image, push to ECR
+#   2. test    — pytest unit tests (runs after build, gating the deploy stage)
+#   3. deploy  — cdk deploy (creates/updates ECS, ALB, Route53)
+#
+# Branch → environment mapping:
+#   sandbox  →  sandbox
+#   nonprod  →  nonprod
+#   prod     →  prod
+#
+# Required GitLab CI/CD variables (Settings → CI/CD → Variables):
+# [all envs] = set once, no environment scope. [per env] = scoped separately
+# to sandbox / nonprod / prod (different AWS accounts get different values).
+#
+# ┌───────────────────────────┬────────────┬──────────────────────────────────┐
+# │ Variable                  │ Scope      │ Notes                            │
+# ├───────────────────────────┼────────────┼──────────────────────────────────┤
+# │ ECR_BASE                  │ [all envs] │ ECR repo base name               │
+# ├───────────────────────────┼────────────┼──────────────────────────────────┤
+# │ AWS_ACCOUNT_ID             │ [per env]  │ 12-digit AWS account number      │
+# │ AWS_ROLE_NAME              │ [per env]  │ IAM role name to assume          │
+# │ AWS_DEFAULT_REGION         │ [per env]  │ e.g. us-east-1                   │
+# │ EXAMPLE_API_KEY            │ [per env]  │ masked; a fake 3rd-party secret  │
+# │ BROKER_CLIENT_ID           │ [per env]  │ only needed for nonprod/prod     │
+# │ BROKER_CLIENT_SECRET       │ [per env]  │ masked                          │
+# └───────────────────────────┴────────────┴──────────────────────────────────┘
+#
+# NOTE: No static AWS keys are needed here. A runner with an instance role
+# calls sts:AssumeRole on AWS_ROLE_NAME at pipeline run time - this is the
+# "AssumeRole helper" pattern below, and it is the single most important
+# security habit to copy from this file: nobody stores long-lived AWS
+# credentials in GitLab variables.
+# ---------------------------------------------------------------------------
+
+stages:
+  - build
+  - test
+  - deploy
+
+# ---------------------------------------------------------------------------
+# Unit tests (pytest)
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir -r requirements-dev.txt
+    - pytest -v
+
+# ---------------------------------------------------------------------------
+# AssumeRole helper — inlined into before_script of every AWS job.
+# Study this block: it's the reusable piece you'd copy into a brand-new repo.
+# ---------------------------------------------------------------------------
+.assume_role: &assume_role |
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN || true
+  echo "Assuming role: arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_ROLE_NAME}"
+  CREDS=$(aws sts assume-role \
+    --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_ROLE_NAME}" \
+    --role-session-name "gitlab-pipeline-${CI_PIPELINE_ID}" \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+    --output text)
+  export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | awk '{print $1}')
+  export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | awk '{print $2}')
+  export AWS_SESSION_TOKEN=$(echo "$CREDS" | awk '{print $3}')
+  echo "Role assumed. Caller identity:"
+  aws sts get-caller-identity
+
+# ---------------------------------------------------------------------------
+# Build & push Docker image to ECR — one job per environment because each
+# environment can live in a different AWS account (different image, tag,
+# and destination repo), even though the `script:` is identical.
+# ---------------------------------------------------------------------------
+.build_template: &build_template
+  stage: build
+  image: public.ecr.aws/docker/library/debian:bookworm-slim
+  services:
+    - name: public.ecr.aws/docker/library/docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl unzip docker.io ca-certificates
+    - curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.22.0.zip" -o awscliv2.zip
+    - unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
+    - *assume_role
+    - aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+
+build_and_push_sandbox:
+  <<: *build_template
+  environment:
+    name: sandbox
+  script:
+    - export ECR_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_BASE}-sandbox"
+    - export IMAGE_TAG=$(date +%s)-${CI_COMMIT_SHORT_SHA}
+    - echo "IMAGE_TAG=$IMAGE_TAG" > image_info_sandbox.txt
+    - aws ecr describe-repositories --repository-names ${ECR_BASE}-sandbox --region ${AWS_DEFAULT_REGION} >/dev/null 2>&1 || aws ecr create-repository --repository-name ${ECR_BASE}-sandbox --region ${AWS_DEFAULT_REGION}
+    - docker pull "${ECR_REPOSITORY}:latest" || echo "no cache yet"
+    - docker build --cache-from "${ECR_REPOSITORY}:latest" -t ${ECR_REPOSITORY}:${IMAGE_TAG} -t ${ECR_REPOSITORY}:latest .
+    - docker push ${ECR_REPOSITORY}:${IMAGE_TAG}
+    - docker push ${ECR_REPOSITORY}:latest
+  artifacts:
+    paths: [image_info_sandbox.txt]
+    expire_in: 1 hour
+  only: [sandbox]
+
+build_and_push_nonprod:
+  <<: *build_template
+  environment:
+    name: nonprod
+  script:
+    - export ECR_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_BASE}-nonprod"
+    - export IMAGE_TAG=$(date +%s)-${CI_COMMIT_SHORT_SHA}
+    - echo "IMAGE_TAG=$IMAGE_TAG" > image_info_nonprod.txt
+    - aws ecr describe-repositories --repository-names ${ECR_BASE}-nonprod --region ${AWS_DEFAULT_REGION} >/dev/null 2>&1 || aws ecr create-repository --repository-name ${ECR_BASE}-nonprod --region ${AWS_DEFAULT_REGION}
+    - docker pull "${ECR_REPOSITORY}:latest" || echo "no cache yet"
+    - docker build --cache-from "${ECR_REPOSITORY}:latest" -t ${ECR_REPOSITORY}:${IMAGE_TAG} -t ${ECR_REPOSITORY}:latest .
+    - docker push ${ECR_REPOSITORY}:${IMAGE_TAG}
+    - docker push ${ECR_REPOSITORY}:latest
+  artifacts:
+    paths: [image_info_nonprod.txt]
+    expire_in: 1 hour
+  only: [nonprod]
+
+build_and_push_prod:
+  <<: *build_template
+  environment:
+    name: prod
+  script:
+    - export ECR_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_BASE}-prod"
+    - export IMAGE_TAG=$(date +%s)-${CI_COMMIT_SHORT_SHA}
+    - echo "IMAGE_TAG=$IMAGE_TAG" > image_info_prod.txt
+    - aws ecr describe-repositories --repository-names ${ECR_BASE}-prod --region ${AWS_DEFAULT_REGION} >/dev/null 2>&1 || aws ecr create-repository --repository-name ${ECR_BASE}-prod --region ${AWS_DEFAULT_REGION}
+    - docker pull "${ECR_REPOSITORY}:latest" || echo "no cache yet"
+    - docker build --cache-from "${ECR_REPOSITORY}:latest" -t ${ECR_REPOSITORY}:${IMAGE_TAG} -t ${ECR_REPOSITORY}:latest .
+    - docker push ${ECR_REPOSITORY}:${IMAGE_TAG}
+    - docker push ${ECR_REPOSITORY}:latest
+  artifacts:
+    paths: [image_info_prod.txt]
+    expire_in: 1 hour
+  only: [prod]
+
+# ---------------------------------------------------------------------------
+# Deploy via CDK — same script for every environment; only the environment
+# name, dependency, and `only:` branch differ.
+# ---------------------------------------------------------------------------
+.deploy_template: &deploy_template
+  stage: deploy
+  image: node:20-slim
+  variables:
+    NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl unzip
+    - curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.22.0.zip" -o awscliv2.zip
+    - unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
+    - *assume_role
+    - cd cdk
+    - npm ci
+
+deploy_sandbox:
+  <<: *deploy_template
+  environment:
+    name: sandbox
+  dependencies: [build_and_push_sandbox]
+  script:
+    - export IMAGE_TAG=$(grep IMAGE_TAG ../image_info_sandbox.txt | cut -d'=' -f2)
+    - export ARN="arn:aws:acm:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}"
+    - node node_modules/aws-cdk/bin/cdk deploy ExampleServiceStack-sandbox
+        --require-approval never
+        --context environment=sandbox
+        --context arnPrefix=$ARN
+        --context ecrRepositoryName=${ECR_BASE}-sandbox
+        --context imageTag=$IMAGE_TAG
+        --outputs-file cdk-outputs.json
+  only: [sandbox]
+
+deploy_nonprod:
+  <<: *deploy_template
+  environment:
+    name: nonprod
+  dependencies: [build_and_push_nonprod]
+  script:
+    - export IMAGE_TAG=$(grep IMAGE_TAG ../image_info_nonprod.txt | cut -d'=' -f2)
+    - export ARN="arn:aws:acm:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}"
+    - node node_modules/aws-cdk/bin/cdk deploy ExampleServiceStack-nonprod
+        --require-approval never
+        --context environment=nonprod
+        --context arnPrefix=$ARN
+        --context ecrRepositoryName=${ECR_BASE}-nonprod
+        --context imageTag=$IMAGE_TAG
+        --outputs-file cdk-outputs.json
+  only: [nonprod]
+
+deploy_prod:
+  <<: *deploy_template
+  environment:
+    name: prod
+  dependencies: [build_and_push_prod]
+  script:
+    - export IMAGE_TAG=$(grep IMAGE_TAG ../image_info_prod.txt | cut -d'=' -f2)
+    - export ARN="arn:aws:acm:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}"
+    - node node_modules/aws-cdk/bin/cdk deploy ExampleServiceStack-prod
+        --require-approval never
+        --context environment=prod
+        --context arnPrefix=$ARN
+        --context ecrRepositoryName=${ECR_BASE}-prod
+        --context imageTag=$IMAGE_TAG
+        --outputs-file cdk-outputs.json
+  only: [prod]
