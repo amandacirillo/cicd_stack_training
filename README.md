@@ -1,5 +1,7 @@
 # CI/CD & CDK Stack Training
 
+> **Note:** This is a from-scratch recreation of an architectural pattern I built at my employer, not the original production code -- rebuilt with a fabricated/generic domain and no proprietary business logic, credentials, or internal resource identifiers.
+
 A small, runnable model of the **GitLab CI/CD + AWS CDK stack** pattern used
 by `wilbur-template-editor`. It is a standalone training repo, deliberately
 stripped down and using **fake placeholder AWS IDs** (no real account
